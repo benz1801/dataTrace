@@ -1,0 +1,13 @@
+Metadata-Version: 2.4
+Name: etl_visual_explained
+Version: 0.1.0
+Summary: A Jupyter tool for visual debugging of Pandas/Polars data pipelines step-by-step.
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+Requires-Dist: pandas>=1.5.0
+Requires-Dist: ipython>=8.0.0
+Requires-Dist: anywidget>=0.9.0
+Requires-Dist: traitlets>=5.0.0
+Provides-Extra: dev
+Requires-Dist: pytest>=7.0.0; extra == "dev"
+Requires-Dist: black>=22.0; extra == "dev"
