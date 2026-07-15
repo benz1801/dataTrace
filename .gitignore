@@ -70,6 +70,10 @@ Desktop.ini
 *.tsv
 *.log
 
+# Local smoke test artifacts
+output.html
+smoke.py
+
 # Virtual environments
 .venv/
 venv/

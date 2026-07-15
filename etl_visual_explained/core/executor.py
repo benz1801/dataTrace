@@ -39,10 +39,14 @@ class ChainExecutor:
             base_node = chain_nodes[0]
             base_code = ast.unparse(base_node)
             current_obj = eval(base_code, self.global_ns, self.local_ns)
-            
+
             # Step evaluation
             start_time_total = time.perf_counter()
             previous_state = self._extract_state(current_obj)
+
+            # Expose base object info to the renderer (first node in the timeline).
+            result.base_object_name = base_code
+            result.base_state = previous_state
             
             for i in range(1, len(chain_nodes)):
                 node = chain_nodes[i]

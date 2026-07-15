@@ -29,3 +29,5 @@ class ChainResult:
     total_time_ms: float = 0.0
     final_result: Any = None
     error: Optional[str] = None
+    base_state: Optional[DataFrameState] = None
+    base_object_name: Optional[str] = None
