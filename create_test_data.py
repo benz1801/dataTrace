@@ -13,4 +13,12 @@ df = pd.DataFrame({
 df.loc[10:20, 'value'] = np.nan
 
 df.to_csv('test_data.csv', index=False)
+
+# A second, joinable table, for testing multi-table lineage (merge/join).
+categories = pd.DataFrame({
+    'category': ['A', 'B', 'C'],
+    'category_label': ['Alpha', 'Beta', 'Gamma'],
+})
+categories.to_csv('categories.csv', index=False)
+
 print("Test data created successfully.")

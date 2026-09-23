@@ -1,610 +1,310 @@
-from IPython.display import HTML
 import html
-from ..core.models import ChainResult, StepResult, DataFrameState
+import json
+from typing import Optional
+
+from IPython.display import HTML
+
+from ..core.adapters import compute_preview_html, compute_row_count
+from ..core.models import LineageGraph, LineageNode
+from .graph_layout import compute_layout
+
+PFX = "etl-graph"
+
+COL_W = 190
+ROW_H = 100
+NODE_W = 150
+NODE_H = 70
+PAD = 24
 
 
-def _shape_str(state: DataFrameState) -> str:
-    """Render a shape as 'R × C' (unicode multiplication sign)."""
-    if state is None:
+def _cols_str(node: LineageNode) -> str:
+    if node.metadata is None:
         return "—"
-    rows, cols = state.shape
-    return f"{rows}×{cols}"
+    n_cols = len(node.metadata.columns)
+    rows = node.row_count if node.row_count is not None else "?"
+    return f"{rows}×{n_cols}"
 
 
-def _delta_text(before: DataFrameState, after: DataFrameState) -> str:
-    """Build the diff-in-the-connector text. Returns empty string if no change."""
-    if before is None or after is None:
-        return ""
-    rb, cb = before.shape
-    ra, ca = after.shape
-    row_d = ra - rb
-    col_d = ca - cb
-    parts = []
-    if row_d != 0:
-        sign = "+" if row_d > 0 else "−"  # minus sign (U+2212), not hyphen
-        parts.append(f"{sign}{abs(row_d)} rows")
-    if col_d != 0:
-        sign = "+" if col_d > 0 else "−"
-        parts.append(f"{sign}{abs(col_d)} cols")
-    return " · ".join(parts)
+class StaticGraphRenderer:
+    """Renders a LineageGraph as a branching graph (nodes positioned by
+    depth, SVG edges for parent -> child, including multi-parent joins).
 
-
-def _delta_class(before: DataFrameState, after: DataFrameState) -> str:
-    """Classify the connector as positive/negative/neutral."""
-    if before is None or after is None:
-        return "neutral"
-    rb, cb = before.shape
-    ra, ca = after.shape
-    if ra < rb or ca < cb:
-        return "negative"
-    if ra > rb or ca > cb:
-        return "positive"
-    return "neutral"
-
-
-class HTMLRenderer:
-    """Renders ChainResult as a horizontal pipeline visualization for Jupyter.
-
-    Layout:
-      [base node] ─▶[step 1] ─▶[step 2] ─▶ ...
-      The arrow between two nodes carries the shape diff inline (signature element).
-
-    Interaction:
-      - Click a node to expand its detail panel below the timeline.
-      - Keyboard: ← / → moves focus, Enter expands, Esc closes.
-      - ARIA: role=tablist on the timeline, role=tab on each node, role=tabpanel on the detail.
+    Two render modes:
+    - `render_static(eager_details=True)`: computes row_count/preview for
+      every node up front and embeds them in the page. Used as the fallback
+      when no live Python<->JS channel exists (scripts, tests, static export).
+    - `render_skeleton()`: returns bare markup with only cheap metadata
+      (columns/dtypes); row_count/preview stay as "click to compute"
+      placeholders, filled in later by `ui.widget.LineageWidget` over a
+      real comm channel.
     """
 
-    # Class prefix used everywhere: keeps our CSS out of Jupyter's own theme.
-    PFX = "etl-pipe"
+    def __init__(self, graph: LineageGraph):
+        self.graph = graph
+        self.layout = compute_layout(graph)
 
-    def __init__(self, result: ChainResult):
-        self.result = result
+    # ----- shared CSS -------------------------------------------------
 
-    # ----- CSS ------------------------------------------------------------
-
-    def _generate_css(self) -> str:
+    def _css(self) -> str:
         return f"""
         <style>
-            .{self.PFX}-root {{
+            .{PFX}-root {{
                 font-family: 'Inter', 'IBM Plex Sans', system-ui, -apple-system, sans-serif;
-                background: #0F1115;
-                color: #E6E8EC;
-                border: 1px solid #262B36;
-                border-radius: 8px;
-                padding: 18px 20px 16px;
-                margin: 10px 0;
-                font-size: 13px;
-                line-height: 1.45;
+                background: #0F1115; color: #E6E8EC;
+                border: 1px solid #262B36; border-radius: 8px;
+                padding: 18px 20px 16px; margin: 10px 0;
+                font-size: 13px; line-height: 1.45;
             }}
-            .{self.PFX}-header {{
-                display: flex;
-                align-items: baseline;
-                justify-content: space-between;
-                gap: 12px;
-                margin-bottom: 16px;
-                padding-bottom: 10px;
+            .{PFX}-header {{
+                display: flex; align-items: baseline; justify-content: space-between;
+                gap: 12px; margin-bottom: 16px; padding-bottom: 10px;
                 border-bottom: 1px solid #262B36;
             }}
-            .{self.PFX}-title {{
-                font-size: 14px;
-                font-weight: 600;
-                letter-spacing: 0.02em;
-                color: #E6E8EC;
-                font-family: 'JetBrains Mono', 'IBM Plex Mono', ui-monospace, 'Cascadia Mono', monospace;
-            }}
-            .{self.PFX}-title .dot {{
-                color: #E8B339;
-                margin-right: 6px;
-            }}
-            .{self.PFX}-meta {{
+            .{PFX}-title {{
+                font-size: 14px; font-weight: 600; letter-spacing: 0.02em;
                 font-family: 'JetBrains Mono', 'IBM Plex Mono', ui-monospace, monospace;
-                font-size: 11px;
-                color: #8A92A6;
-                text-transform: uppercase;
-                letter-spacing: 0.08em;
             }}
-            .{self.PFX}-meta b {{
-                color: #E6E8EC;
-                font-weight: 600;
-            }}
-
-            .{self.PFX}-err {{
-                background: rgba(232, 74, 74, 0.08);
-                border-left: 3px solid #E84A4A;
-                color: #E84A4A;
-                padding: 10px 14px;
-                border-radius: 4px;
+            .{PFX}-title .dot {{ color: #E8B339; margin-right: 6px; }}
+            .{PFX}-meta {{
                 font-family: 'JetBrains Mono', ui-monospace, monospace;
-                font-size: 12px;
+                font-size: 11px; color: #8A92A6; text-transform: uppercase; letter-spacing: 0.08em;
+            }}
+            .{PFX}-meta b {{ color: #E6E8EC; font-weight: 600; }}
+            .{PFX}-err {{
+                background: rgba(232, 74, 74, 0.08); border-left: 3px solid #E84A4A;
+                color: #E84A4A; padding: 10px 14px; border-radius: 4px;
+                font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 12px;
                 margin-bottom: 14px;
             }}
-
-            /* Timeline */
-            .{self.PFX}-timeline {{
-                display: flex;
-                align-items: stretch;
-                overflow-x: auto;
-                padding: 4px 0 12px;
-                scroll-snap-type: x proximity;
+            .{PFX}-canvas {{ position: relative; overflow: auto; }}
+            .{PFX}-canvas svg {{ position: absolute; top: 0; left: 0; pointer-events: none; }}
+            .{PFX}-edge {{ stroke: #3a4150; stroke-width: 1.5; }}
+            .{PFX}-edge.join {{ stroke: #E8B339; }}
+            .{PFX}-node {{
+                position: absolute; appearance: none; background: #181C24;
+                border: 1px solid #262B36; border-radius: 6px; padding: 8px 10px;
+                width: {NODE_W}px; height: {NODE_H}px; text-align: left; cursor: pointer;
+                font: inherit; color: inherit; display: flex; flex-direction: column; gap: 3px;
+                transition: border-color 120ms ease, background 120ms ease;
             }}
-            .{self.PFX}-timeline::-webkit-scrollbar {{ height: 6px; }}
-            .{self.PFX}-timeline::-webkit-scrollbar-thumb {{ background: #262B36; border-radius: 3px; }}
-
-            .{self.PFX}-node {{
-                scroll-snap-align: start;
-                appearance: none;
-                background: #181C24;
-                border: 1px solid #262B36;
-                border-radius: 6px;
-                padding: 10px 12px;
-                min-width: 130px;
-                text-align: left;
-                cursor: pointer;
-                font: inherit;
-                color: inherit;
-                transition: border-color 120ms ease, box-shadow 120ms ease, background 120ms ease;
-                display: flex;
-                flex-direction: column;
-                gap: 4px;
+            .{PFX}-node:hover {{ border-color: #3a4150; background: #1c212b; }}
+            .{PFX}-node:focus-visible {{ outline: none; border-color: #E8B339; box-shadow: 0 0 0 2px rgba(232, 179, 57, 0.25); }}
+            .{PFX}-node[aria-selected="true"] {{ border-color: #E8B339; box-shadow: 0 0 0 1.5px #E8B339; background: #1c212b; }}
+            .{PFX}-node.is-base {{ border-style: dashed; }}
+            .{PFX}-node.is-error {{ border-color: #E84A4A; }}
+            .{PFX}-node-name {{
+                font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 12px;
+                font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
             }}
-            .{self.PFX}-node:hover {{
-                border-color: #3a4150;
-                background: #1c212b;
-            }}
-            .{self.PFX}-node:focus-visible {{
-                outline: none;
-                border-color: #E8B339;
-                box-shadow: 0 0 0 2px rgba(232, 179, 57, 0.25);
-            }}
-            .{self.PFX}-node[aria-selected="true"] {{
-                border-color: #E8B339;
-                box-shadow: 0 0 0 1.5px #E8B339;
-                background: #1c212b;
-            }}
-            .{self.PFX}-node.is-base {{
-                border-style: dashed;
-            }}
-            .{self.PFX}-node-num {{
-                font-family: 'JetBrains Mono', 'IBM Plex Mono', ui-monospace, monospace;
-                font-size: 10px;
-                color: #8A92A6;
-                letter-spacing: 0.1em;
-                text-transform: uppercase;
-            }}
-            .{self.PFX}-node-name {{
-                font-family: 'JetBrains Mono', 'IBM Plex Mono', ui-monospace, monospace;
-                font-size: 13px;
-                color: #E6E8EC;
-                font-weight: 600;
-            }}
-            .{self.PFX}-node-shape {{
-                font-family: 'JetBrains Mono', 'IBM Plex Mono', ui-monospace, monospace;
-                font-size: 11px;
-                color: #8A92A6;
-            }}
-            .{self.PFX}-node-time {{
-                font-family: 'JetBrains Mono', 'IBM Plex Mono', ui-monospace, monospace;
-                font-size: 10px;
-                color: #8A92A6;
-                margin-top: 2px;
-            }}
-            .{self.PFX}-node.is-base .{self.PFX}-node-name {{ color: #E8B339; }}
-
-            /* Connectors (signature: diff-in-the-connector) */
-            .{self.PFX}-conn {{
-                display: flex;
-                align-items: center;
-                padding: 0 6px;
-                color: #E8B339;
-                font-family: 'JetBrains Mono', 'IBM Plex Mono', ui-monospace, monospace;
-                font-size: 11px;
-                white-space: nowrap;
-                min-width: 56px;
-            }}
-            .{self.PFX}-conn .arrow {{ font-size: 14px; line-height: 1; }}
-            .{self.PFX}-conn .delta {{ margin: 0 4px; }}
-            .{self.PFX}-conn.positive .delta {{ color: #5FB87A; }}
-            .{self.PFX}-conn.negative .delta {{ color: #E07B7B; }}
-            .{self.PFX}-conn.neutral .delta {{ color: #4a5060; }}
-            .{self.PFX}-conn.neutral .arrow {{ color: #4a5060; }}
-
-            /* Detail panel */
-            .{self.PFX}-panel {{
-                display: none;
-                background: #181C24;
-                border: 1px solid #262B36;
-                border-radius: 6px;
-                padding: 14px 16px;
-                margin-top: 4px;
-            }}
-            .{self.PFX}-panel.is-open {{ display: block; }}
-            .{self.PFX}-panel-grid {{
-                display: grid;
-                grid-template-columns: 1fr 1fr;
-                gap: 16px;
-            }}
-            @media (max-width: 720px) {{
-                .{self.PFX}-panel-grid {{ grid-template-columns: 1fr; }}
-            }}
-            .{self.PFX}-panel h4 {{
-                font-size: 11px;
-                color: #8A92A6;
-                text-transform: uppercase;
-                letter-spacing: 0.08em;
-                margin: 0 0 8px;
-                font-weight: 600;
-            }}
-            .{self.PFX}-code {{
-                background: #0B0D11;
-                border: 1px solid #262B36;
-                border-radius: 4px;
-                padding: 10px 12px;
-                font-family: 'JetBrains Mono', 'IBM Plex Mono', ui-monospace, monospace;
-                font-size: 12px;
-                color: #E6E8EC;
-                overflow-x: auto;
-                white-space: pre;
-                line-height: 1.5;
-            }}
-            .{self.PFX}-metrics {{
-                display: flex;
-                gap: 8px;
-                flex-wrap: wrap;
-                margin-top: 4px;
-            }}
-            .{self.PFX}-chip {{
-                font-family: 'JetBrains Mono', ui-monospace, monospace;
-                font-size: 11px;
-                background: #0B0D11;
-                border: 1px solid #262B36;
-                border-radius: 4px;
-                padding: 4px 8px;
-                color: #E6E8EC;
-            }}
-            .{self.PFX}-chip b {{ color: #E8B339; font-weight: 600; }}
-            .{self.PFX}-chip.pos {{ border-color: rgba(95, 184, 122, 0.4); }}
-            .{self.PFX}-chip.neg {{ border-color: rgba(224, 123, 123, 0.4); }}
-            .{self.PFX}-dtypes {{
-                font-family: 'JetBrains Mono', ui-monospace, monospace;
-                font-size: 11px;
-                color: #8A92A6;
-                margin-top: 8px;
-                max-height: 120px;
-                overflow-y: auto;
-            }}
-            .{self.PFX}-dtypes span {{ display: inline-block; margin-right: 12px; }}
-            .{self.PFX}-dtypes b {{ color: #E6E8EC; }}
-            .{self.PFX}-preview {{
-                margin-top: 12px;
-                overflow-x: auto;
-                font-family: 'Inter', system-ui, sans-serif;
-            }}
-            .{self.PFX}-preview table {{
-                border-collapse: collapse;
-                font-size: 12px;
-                width: 100%;
-            }}
-            .{self.PFX}-preview th, .{self.PFX}-preview td {{
-                border: 1px solid #262B36;
-                padding: 4px 8px;
-                text-align: left;
-            }}
-            .{self.PFX}-preview th {{
-                background: #0B0D11;
-                color: #8A92A6;
-                font-weight: 600;
-                text-transform: uppercase;
-                font-size: 10px;
-                letter-spacing: 0.05em;
-            }}
-            .{self.PFX}-preview td {{ color: #E6E8EC; }}
-
-            @media (prefers-reduced-motion: reduce) {{
-                .{self.PFX}-node {{ transition: none; }}
-            }}
+            .{PFX}-node.is-base .{PFX}-node-name {{ color: #E8B339; }}
+            .{PFX}-node-shape {{ font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 11px; color: #8A92A6; }}
+            .{PFX}-panel {{ display: none; background: #181C24; border: 1px solid #262B36; border-radius: 6px; padding: 14px 16px; margin-top: 12px; }}
+            .{PFX}-panel.is-open {{ display: block; }}
+            .{PFX}-panel-grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }}
+            @media (max-width: 720px) {{ .{PFX}-panel-grid {{ grid-template-columns: 1fr; }} }}
+            .{PFX}-panel h4 {{ font-size: 11px; color: #8A92A6; text-transform: uppercase; letter-spacing: 0.08em; margin: 0 0 8px; font-weight: 600; }}
+            .{PFX}-code {{ background: #0B0D11; border: 1px solid #262B36; border-radius: 4px; padding: 10px 12px; font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 12px; overflow-x: auto; white-space: pre; }}
+            .{PFX}-metrics {{ display: flex; gap: 8px; flex-wrap: wrap; margin-top: 4px; }}
+            .{PFX}-chip {{ font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 11px; background: #0B0D11; border: 1px solid #262B36; border-radius: 4px; padding: 4px 8px; }}
+            .{PFX}-chip b {{ color: #E8B339; font-weight: 600; }}
+            .{PFX}-dtypes {{ font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 11px; color: #8A92A6; margin-top: 8px; max-height: 120px; overflow-y: auto; }}
+            .{PFX}-dtypes span {{ display: inline-block; margin-right: 12px; }}
+            .{PFX}-dtypes b {{ color: #E6E8EC; }}
+            .{PFX}-preview {{ margin-top: 12px; overflow-x: auto; font-family: 'Inter', system-ui, sans-serif; }}
+            .{PFX}-preview table {{ border-collapse: collapse; font-size: 12px; width: 100%; }}
+            .{PFX}-preview th, .{PFX}-preview td {{ border: 1px solid #262B36; padding: 4px 8px; text-align: left; }}
+            .{PFX}-preview th {{ background: #0B0D11; color: #8A92A6; font-weight: 600; text-transform: uppercase; font-size: 10px; }}
+            .{PFX}-load {{ margin-top: 10px; background: #0B0D11; border: 1px solid #E8B339; color: #E8B339; border-radius: 4px; padding: 6px 10px; font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 11px; cursor: pointer; }}
+            .{PFX}-load:hover {{ background: #1c212b; }}
+            .{PFX}-live[data-loading="1"] {{ opacity: 0.5; }}
         </style>
         """
 
-    # ----- Per-step rendering --------------------------------------------
+    # ----- node/edge markup --------------------------------------------
 
-    def _render_node_button(
-        self, *, node_id: str, index_label: str, op_name: str, shape: str,
-        time_ms: float | None, is_base: bool, is_error: bool,
-    ) -> str:
-        time_html = ""
-        if time_ms is not None:
-            time_html = f'<div class="{self.PFX}-node-time">⏱ {time_ms:.2f} ms</div>'
+    def _canvas_size(self):
+        if not self.layout:
+            return PAD * 2, PAD * 2
+        max_col = max(c for c, _ in self.layout.values())
+        max_row = max(r for _, r in self.layout.values())
+        width = PAD * 2 + max_col * COL_W + NODE_W
+        height = PAD * 2 + max_row * ROW_H + NODE_H
+        return width, height
 
-        error_class = f' {self.PFX}-node-error' if is_error else ""
-        base_class = f' {self.PFX}-is-base' if is_base else ""
+    def _node_center(self, node_id: str):
+        col, row = self.layout[node_id]
+        x = PAD + col * COL_W
+        y = PAD + row * ROW_H
+        return x, y
+
+    def _render_node_button(self, node: LineageNode) -> str:
+        x, y = self._node_center(node.node_id)
+        classes = [f"{PFX}-node"]
+        if node.is_base:
+            classes.append("is-base")
+        if node.is_error:
+            classes.append("is-error")
+        name = html.escape(node.label)
+        shape = html.escape(_cols_str(node))
         return f"""
-        <button type="button"
-                id="{node_id}"
-                class="{self.PFX}-node{base_class}{error_class}"
-                role="tab"
-                aria-selected="false"
-                aria-controls="{self.PFX}-panel"
-                tabindex="-1">
-            <div class="{self.PFX}-node-num">{index_label}</div>
-            <div class="{self.PFX}-node-name">{html.escape(op_name)}</div>
-            <div class="{self.PFX}-node-shape">{html.escape(shape)}</div>
-            {time_html}
+        <button type="button" id="{PFX}-{node.node_id}"
+                class="{' '.join(classes)}" role="tab" aria-selected="false"
+                aria-controls="{PFX}-panel" tabindex="-1"
+                style="left:{x}px; top:{y}px;" data-node-id="{node.node_id}">
+            <div class="{PFX}-node-name">{name}</div>
+            <div class="{PFX}-node-shape">{shape}</div>
         </button>
         """
 
-    def _render_connector(self, *, before: DataFrameState, after: DataFrameState) -> str:
-        # If either side is missing (e.g. groupby returns a DataFrameGroupBy, not
-        # a DataFrame, and the executor can't capture its shape), fall back to a
-        # neutral "no diff available" indicator instead of a misleading number.
-        if before is None or after is None:
-            return f"""
-            <div class="{self.PFX}-conn neutral" aria-hidden="true">
-                <span class="delta">·</span>
-                <span class="arrow">▶</span>
-            </div>
-            """
-        cls = _delta_class(before, after)
-        delta = _delta_text(before, after)
-        delta_html = f'<span class="delta">{html.escape(delta)}</span>' if delta else ''
-        return f"""
-        <div class="{self.PFX}-conn {cls}" aria-hidden="true">
-            {delta_html}
-            <span class="arrow">▶</span>
-        </div>
-        """
+    def _render_edges_svg(self, width: int, height: int) -> str:
+        lines = []
+        for node in self.graph.nodes.values():
+            is_join = len(node.parent_ids) > 1
+            cx, cy = self._node_center(node.node_id)
+            child_y = cy + NODE_H / 2
+            for parent_id in node.parent_ids:
+                px, py = self._node_center(parent_id)
+                parent_right = px + NODE_W
+                parent_mid_y = py + NODE_H / 2
+                cls = "join" if is_join else ""
+                lines.append(
+                    f'<line class="{PFX}-edge {cls}" x1="{parent_right}" y1="{parent_mid_y}" '
+                    f'x2="{cx}" y2="{child_y}" />'
+                )
+        return f'<svg width="{width}" height="{height}">{"".join(lines)}</svg>'
 
-    def _render_detail(self, step: StepResult | None, is_base: bool, base_name: str | None) -> str:
-        """Render the (hidden by default) detail panel content for the currently active step."""
-        if is_base:
-            op_label = "input"
-            code = base_name or "input"
-            state = self.result.base_state
-            time_ms = None
-            index_label = "BASE"
-        else:
-            assert step is not None
-            op_label = step.operation_name
-            code = step.code_snippet
-            state = step.state_after
-            time_ms = step.execution_time_ms
-            index_label = f"step {step.step_index}"
+    # ----- detail panel --------------------------------------------------
 
-        if state is None:
-            shape_chip = '<span class="' + self.PFX + '-chip">no dataframe</span>'
-        else:
-            shape_chip = f'<span class="{self.PFX}-chip">shape <b>{_shape_str(state)}</b></span>'
+    def _render_detail(self, node: LineageNode, interactive: bool) -> str:
+        code = html.escape(node.code_snippet)
+        op_label = html.escape(node.operation_name or ("input" if node.is_base else node.node_id))
 
-        time_chip = ""
-        if time_ms is not None:
-            time_chip = f'<span class="{self.PFX}-chip">⏱ <b>{time_ms:.2f}</b> ms</span>'
-
-        # Shape diff vs previous (only meaningful for non-base)
-        diff_chips = ""
-        if not is_base and step is not None and step.state_before and step.state_after:
-            rb, cb = step.state_before.shape
-            ra, ca = step.state_after.shape
-            row_d = ra - rb
-            col_d = ca - cb
-            if row_d != 0:
-                cls = "pos" if row_d > 0 else "neg"
-                sign = "+" if row_d > 0 else "−"
-                diff_chips += f'<span class="{self.PFX}-chip {cls}">rows {sign}{abs(row_d)}</span>'
-            if col_d != 0:
-                cls = "pos" if col_d > 0 else "neg"
-                sign = "+" if col_d > 0 else "−"
-                diff_chips += f'<span class="{self.PFX}-chip {cls}">cols {sign}{abs(col_d)}</span>'
-
-        # Dtypes
+        cols_chip = ""
         dtypes_html = ""
-        if state and state.dtypes:
+        if node.metadata is not None:
+            cols_chip = f'<span class="{PFX}-chip">cols <b>{len(node.metadata.columns)}</b></span>'
             items = "".join(
                 f"<span><b>{html.escape(c)}</b>: {html.escape(t)}</span>"
-                for c, t in state.dtypes.items()
+                for c, t in node.metadata.dtypes.items()
             )
-            dtypes_html = f'<div class="{self.PFX}-dtypes">{items}</div>'
+            dtypes_html = f'<div class="{PFX}-dtypes">{items}</div>'
 
-        # Head preview (HTML produced by pandas)
-        preview_html = ""
-        if state and state.head_preview:
-            preview_html = f'<div class="{self.PFX}-preview">{state.head_preview}</div>'
+        time_chip = ""
+        if node.execution_time_ms is not None:
+            time_chip = f'<span class="{PFX}-chip">⏱ <b>{node.execution_time_ms:.2f}</b> ms</span>'
 
-        # Error inside a step (if any)
         err_html = ""
-        if step is not None and step.error:
-            err_html = f'<div class="{self.PFX}-err">❌ {html.escape(step.error)}</div>'
+        if node.error:
+            err_html = f'<div class="{PFX}-err">❌ {html.escape(node.error)}</div>'
+
+        live_html = self._render_live_block(node, interactive)
 
         return f"""
-        <div class="{self.PFX}-panel-grid">
+        <div class="{PFX}-panel-grid">
             <div>
-                <h4>{html.escape(index_label)} · {html.escape(op_label)}</h4>
-                <div class="{self.PFX}-code">{html.escape(code)}</div>
-                <div class="{self.PFX}-metrics">
-                    {shape_chip}{time_chip}{diff_chips}
-                </div>
+                <h4>{html.escape(node.node_id)} · {op_label}</h4>
+                <div class="{PFX}-code">{code}</div>
+                <div class="{PFX}-metrics">{cols_chip}{time_chip}</div>
                 {dtypes_html}
                 {err_html}
             </div>
-            <div>
-                <h4>head preview</h4>
-                {preview_html if preview_html else '<div class="' + self.PFX + '-dtypes">no preview available</div>'}
-            </div>
+            <div>{live_html}</div>
         </div>
         """
 
-    # ----- Top-level render ----------------------------------------------
+    def _render_live_block(self, node: LineageNode, interactive: bool) -> str:
+        """The part of the detail panel that depends on row_count/preview.
+        In eager mode these are already computed; in interactive mode they
+        show a button until the widget layer fills them in on demand."""
+        if not interactive:
+            row_chip = f'<span class="{PFX}-chip">righe <b>{compute_row_count(node)}</b></span>'
+            preview = compute_preview_html(node)
+            preview_html = f'<div class="{PFX}-preview">{preview}</div>' if preview else \
+                f'<div class="{PFX}-dtypes">nessuna anteprima disponibile</div>'
+            return f'<h4>anteprima</h4><div class="{PFX}-metrics">{row_chip}</div>{preview_html}'
 
-    def render(self) -> HTML:
-        # Build timeline items: [base, step1, step2, ...]
-        items: list[dict] = []
+        if node.row_count is not None:
+            row_chip = f'<span class="{PFX}-chip">righe <b>{node.row_count}</b></span>'
+            preview_html = f'<div class="{PFX}-preview">{node.preview_html or ""}</div>'
+            return f'<h4>anteprima</h4><div class="{PFX}-metrics">{row_chip}</div>{preview_html}'
 
-        # Base node
-        if self.result.base_state is not None or self.result.base_object_name:
-            items.append({
-                "is_base": True,
-                "index_label": "INPUT",
-                "op_name": self.result.base_object_name or "input",
-                "shape": _shape_str(self.result.base_state) if self.result.base_state else "—",
-                "time_ms": None,
-                "is_error": False,
-            })
+        return (
+            f'<h4>anteprima</h4>'
+            f'<div class="{PFX}-live" data-node-id="{node.node_id}" data-loading="0">'
+            f'<button type="button" class="{PFX}-load" data-node-id="{node.node_id}">'
+            f'Calcola righe e anteprima</button></div>'
+        )
 
-        # Steps
-        for step in self.result.steps:
-            items.append({
-                "is_base": False,
-                "step": step,
-                "index_label": f"STEP {step.step_index:02d}",
-                "op_name": step.operation_name,
-                "shape": _shape_str(step.state_after) if step.state_after else "—",
-                "time_ms": step.execution_time_ms,
-                "is_error": bool(step.error),
-            })
+    # ----- top-level render -----------------------------------------------
 
-        # Pre-compute connectors: connector i sits between items[i] and items[i+1].
-        # For the first connector (input → step1), diff is base_state vs step1.state_after.
-        def state_of(it: dict) -> DataFrameState | None:
-            if it["is_base"]:
-                return self.result.base_state
-            return it["step"].state_after  # type: ignore[union-attr]
+    def _body(self, interactive: bool) -> str:
+        width, height = self._canvas_size()
+        nodes_html = "".join(self._render_node_button(n) for n in self.graph.nodes.values())
+        edges_svg = self._render_edges_svg(width, height)
 
-        # Build timeline HTML
-        timeline_parts: list[str] = []
-        for i, it in enumerate(items):
-            node_id = f"{self.PFX}-n-{i}"
-            timeline_parts.append(self._render_node_button(
-                node_id=node_id,
-                index_label=it["index_label"],
-                op_name=it["op_name"],
-                shape=it["shape"],
-                time_ms=it["time_ms"],
-                is_base=it["is_base"],
-                is_error=it["is_error"],
-            ))
-            if i < len(items) - 1:
-                before = state_of(it)
-                after = state_of(items[i + 1])
-                timeline_parts.append(self._render_connector(before=before, after=after))
-
-        timeline_html = f"""
-        <div class="{self.PFX}-timeline" role="tablist" aria-label="ETL pipeline steps">
-            {''.join(timeline_parts)}
-        </div>
-        """
-
-        # Build the (initially empty) detail panel. Content is filled by JS on activation.
-        panel_html = f"""
-        <div id="{self.PFX}-panel"
-             class="{self.PFX}-panel"
-             role="tabpanel"
-             aria-labelledby="{self.PFX}-n-0"
-             tabindex="0">
-        </div>
-        """
-
-        # Error banner (chain-level)
-        err_banner = ""
-        if self.result.error:
-            err_banner = f'<div class="{self.PFX}-err">❌ {html.escape(self.result.error)}</div>'
-
-        # Header
-        steps_n = len(self.result.steps)
-        total_ms = self.result.total_time_ms
+        err_banner = f'<div class="{PFX}-err">❌ {html.escape(self.graph.error)}</div>' if self.graph.error else ""
+        n_nodes = len(self.graph.nodes)
         header_html = f"""
-        <div class="{self.PFX}-header">
-            <div class="{self.PFX}-title"><span class="dot">●</span>etl / visual chain</div>
-            <div class="{self.PFX}-meta">
-                <b>{steps_n}</b> steps · <b>{total_ms:.2f}</b> ms total
-            </div>
+        <div class="{PFX}-header">
+            <div class="{PFX}-title"><span class="dot">●</span>etl / lineage graph</div>
+            <div class="{PFX}-meta"><b>{n_nodes}</b> nodes · <b>{self.graph.total_time_ms:.2f}</b> ms total</div>
         </div>
         """
 
-        # Pre-rendered detail templates for each node, embedded as JSON for the JS to use.
-        # We embed Python-built HTML strings into a JS array via JSON.
-        import json
-        details = []
-        for it in items:
-            if it["is_base"]:
-                details.append(self._render_detail(
-                    step=None, is_base=True, base_name=self.result.base_object_name
-                ))
-            else:
-                details.append(self._render_detail(
-                    step=it["step"], is_base=False, base_name=None
-                ))
+        canvas_html = f"""
+        <div class="{PFX}-canvas" role="tablist" aria-label="ETL lineage graph"
+             style="width:{width}px; height:{height}px;">
+            {edges_svg}
+            {nodes_html}
+        </div>
+        """
+
+        panel_html = f'<div id="{PFX}-panel" class="{PFX}-panel" role="tabpanel" tabindex="0"></div>'
+
+        return f"""
+        <div class="{PFX}-root" data-interactive="{"1" if interactive else "0"}">
+            {header_html}
+            {err_banner}
+            {canvas_html}
+            {panel_html}
+        </div>
+        """
+
+    def render_skeleton(self) -> str:
+        """Bare markup for the widget layer: cheap metadata only, no inline
+        JS (the widget's own JS drives interactivity via anywidget's comm)."""
+        return f"{self._css()}{self._body(interactive=True)}"
+
+    def detail_html_by_node(self, interactive: bool) -> dict:
+        return {n.node_id: self._render_detail(n, interactive) for n in self.graph.nodes.values()}
+
+    def render_static(self, eager_details: bool = True) -> HTML:
+        """Self-contained static render with inline JS tab behavior. Used
+        whenever no live Python<->JS channel is available (scripts, tests,
+        notebook export)."""
+        details = self.detail_html_by_node(interactive=not eager_details)
         details_json = json.dumps(details)
 
-        # Inline JS: tablist semantics, click + keyboard nav.
         js = f"""
         <script>
         (function() {{
-            const roots = document.querySelectorAll('.{self.PFX}-root');
+            const roots = document.querySelectorAll('.{PFX}-root[data-interactive="0"]');
             roots.forEach(initRoot);
             function initRoot(root) {{
                 if (root.dataset.etlInit === '1') return;
                 root.dataset.etlInit = '1';
-                const tabs = Array.from(root.querySelectorAll('.{self.PFX}-node'));
-                const panel = root.querySelector('#{self.PFX}-panel');
+                const tabs = Array.from(root.querySelectorAll('.{PFX}-node'));
+                const panel = root.querySelector('.{PFX}-panel');
                 const details = {details_json};
-                // Build a map nodeId -> detailsHtml
-                const idToDetail = {{}};
-                tabs.forEach((t, i) => {{ idToDetail[t.id] = details[i]; }});
-
-                function select(i, expand) {{
-                    tabs.forEach((t, j) => {{
-                        const selected = (j === i);
-                        t.setAttribute('aria-selected', selected ? 'true' : 'false');
-                        t.setAttribute('tabindex', selected ? '0' : '-1');
-                    }});
-                    if (expand) {{
-                        panel.innerHTML = idToDetail[tabs[i].id];
-                        panel.classList.add('is-open');
-                        panel.setAttribute('aria-labelledby', tabs[i].id);
-                        // Scroll into view if below the fold
-                        const r = panel.getBoundingClientRect();
-                        if (r.bottom > window.innerHeight - 20) {{
-                            panel.scrollIntoView({{ behavior: 'smooth', block: 'nearest' }});
-                        }}
-                    }}
+                function select(i) {{
+                    tabs.forEach((t, j) => t.setAttribute('aria-selected', j === i ? 'true' : 'false'));
+                    panel.innerHTML = details[tabs[i].dataset.nodeId] || '';
+                    panel.classList.add('is-open');
                 }}
-
-                tabs.forEach((t, i) => {{
-                    t.addEventListener('click', () => select(i, true));
-                    t.addEventListener('keydown', (e) => {{
-                        if (e.key === 'Enter' || e.key === ' ') {{
-                            e.preventDefault();
-                            select(i, true);
-                        }} else if (e.key === 'ArrowRight') {{
-                            e.preventDefault();
-                            const next = (i + 1) % tabs.length;
-                            tabs[next].focus();
-                            select(next, true);
-                        }} else if (e.key === 'ArrowLeft') {{
-                            e.preventDefault();
-                            const prev = (i - 1 + tabs.length) % tabs.length;
-                            tabs[prev].focus();
-                            select(prev, true);
-                        }} else if (e.key === 'Escape') {{
-                            panel.classList.remove('is-open');
-                            panel.innerHTML = '';
-                        }}
-                    }});
-                }});
-
-                // Open the first tab by default so users immediately see what's inside.
-                if (tabs.length) select(0, true);
+                tabs.forEach((t, i) => t.addEventListener('click', () => select(i)));
+                if (tabs.length) select(0);
             }}
         }})();
         </script>
         """
-
-        root_html = f"""
-        <div class="{self.PFX}-root">
-            {header_html}
-            {err_banner}
-            {timeline_html}
-            {panel_html}
-            {js}
-        </div>
-        """
-        return HTML(f"{self._generate_css()}{root_html}")
+        return HTML(f"{self._css()}{self._body(interactive=False)}{js}")

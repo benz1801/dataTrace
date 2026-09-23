@@ -13,12 +13,15 @@ shell.run_cell('''
 import pandas as pd
 import numpy as np
 df = pd.read_csv("test_data.csv")
+categories = pd.read_csv("categories.csv")
 ''')
 
-print("Testing visual_chain magic...")
+from etl_visual_explained.core.executor import LineageExecutor
+from etl_visual_explained.ui.renderer import StaticGraphRenderer
 
-# Run the magic
-cell_code = """
+print("Testing visual_chain magic (single-table chain)...")
+
+single_table_cell = """
 result_df = (
     df
     .dropna()
@@ -31,32 +34,46 @@ result_df = (
 
 # Call the magic method directly for testing outside a notebook environment
 # The first argument 'line' is empty string for cell magic
-magic.visual_chain("", cell_code)
+magic.visual_chain("", single_table_cell)
 
-# Render the pipeline independently so we can inspect the HTML (the magic
-# itself uses IPython.display, which doesn't return the object).
-from etl_visual_explained.core.executor import ChainExecutor
-from etl_visual_explained.ui.renderer import HTMLRenderer
-
-executor = ChainExecutor(cell_code, shell.user_ns, shell.user_ns)
-result = executor.execute()
-html_obj = HTMLRenderer(result).render()
+graph = LineageExecutor(single_table_cell, shell.user_ns, shell.user_ns).execute()
+html_obj = StaticGraphRenderer(graph).render_static(eager_details=True)
 html_str = html_obj.data if hasattr(html_obj, "data") else str(html_obj)
 
-# Basic structural assertions on the rendered HTML.
-assert "etl-pipe-root" in html_str, "pipeline root container not found"
-assert "etl-pipe-timeline" in html_str, "timeline not found"
+assert "etl-graph-root" in html_str, "graph root container not found"
 assert 'role="tablist"' in html_str, "tablist ARIA role missing"
 assert 'role="tab"' in html_str, "tab ARIA role missing"
 assert 'role="tabpanel"' in html_str, "tabpanel ARIA role missing"
-assert "dropna" in html_str, "expected step 'dropna' in timeline"
-assert "filter" in html_str, "expected step 'filter' in timeline"
-assert "assign" in html_str, "expected step 'assign' in timeline"
-assert "groupby" in html_str, "expected step 'groupby' in timeline"
-assert "▶" in html_str, "connector arrows missing"
-# Diff-in-the-connector (signature): at least one delta annotation
-assert any(d in html_str for d in ["rows", "cols"]), "no shape diff in any connector"
-print("Test passed: structural assertions OK.")
-print(f"HTML size: {len(html_str):,} bytes")
+assert "dropna" in html_str, "expected step 'dropna' in graph"
+assert "filter" in html_str, "expected step 'filter' in graph"
+assert "assign" in html_str, "expected step 'assign' in graph"
+assert "groupby" in html_str, "expected step 'groupby' in graph"
+print(f"Test passed: structural assertions OK ({len(html_str):,} bytes).")
 
-print("Test finished.")
+print("\nTesting multi-table lineage (merge) in a single cell...")
+
+join_cell = """
+enriched = (
+    df
+    .dropna()
+    .merge(categories, on="category", how="left")
+    .assign(is_big=lambda x: x["value"] > 50)
+)
+"""
+
+join_graph = LineageExecutor(join_cell, shell.user_ns, shell.user_ns).execute()
+
+merge_nodes = [n for n in join_graph.nodes.values() if n.operation_name == "merge"]
+assert len(merge_nodes) == 1, "expected exactly one merge node"
+assert len(merge_nodes[0].parent_ids) == 2, "merge node must have 2 parents (join)"
+
+base_vars = {n.origin_var for n in join_graph.roots()}
+assert {"df", "categories"} <= base_vars, "both base tables must appear as roots"
+
+join_html_obj = StaticGraphRenderer(join_graph).render_static(eager_details=True)
+join_html_str = join_html_obj.data if hasattr(join_html_obj, "data") else str(join_html_obj)
+assert "merge" in join_html_str
+assert "etl-graph-edge" in join_html_str, "expected SVG edges connecting parents to children"
+print(f"Test passed: merge node has 2 parents, both base tables tracked ({len(join_html_str):,} bytes).")
+
+print("\nAll tests finished.")
